@@ -1,0 +1,267 @@
+---
+title: "DeSeq2_pipeline"
+author: "Weihan Liu"
+date: "28/07/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+##data loading and initial set up
+
+Load necessary libraries. 
+
+```{r}
+library(DESeq2)
+library(RColorBrewer) #for plotting
+library(pheatmap) #for plotting
+library(tidyverse)# for data wrangling
+```
+
+I used the smoc2 kidney fibrosis data as the demo data here, but you need to tailor this to our own dataset later.
+
+create your metadata file
+```{r}
+#create vectors containing the columns of your metadata
+genotype <- c("smoc2_oe","smoc2_oe","smoc2_oe","smoc2_oe","smoc2_oe","smoc2_oe","smoc2_oe")
+conditions <- c("fibrosis","fibrosis","normal","normal","fibrosis","normal","fibrosis")
+day_collection <- c("1","2","1","2","2","1","1")
+technician <- c("Mary", "Mary", "Tom","Tom","Mary","Tom","Mary")
+
+
+
+#+ other optional columns
+#combines the vectors into a dataframe
+meta_data <- data.frame(genotype, conditions,day_collection,technician)
+
+#add sample names in a vextor as row names. note that the row names in meta data need to be in the same order as the column/sample names in count matrix
+row.names(meta_data) <- c("smoc2_fibrosis1","smoc2_fibrosis4","smoc2_normal1","smoc2_normal3","smoc2_fibrosis3","smoc2_normal4","smoc2_fibrosis2")
+meta_data
+```
+
+
+
+Read in Count Matrix. 
+Note that reading in the data as .txt format is the easiest. Because the sample names and gene names need to be the colnames and rownames of the matrix, respectively. .txt files automatically satisfy this, while .csv doesn't. If you receive your count matrix as a csv file, you can just save it as a .txt file.  We import raw rather than normalized count because DESeq2 will perform internal normalization itself, so it requires raw counts as input.
+```{r pressure, echo=FALSE}
+raw_count <- read.table("/Users/weihan/Desktop/Research/shirley/deseq2_demo_data/fibrosis_smoc2_rawcounts_unordered.txt",stringsAsFactors = FALSE) #comes from Rsubreads
+str(raw_count)
+head(raw_count)#examing raw count matrix
+```
+
+plot the distribution of raw read counts, you can plot for each sample, or all sample combined
+```{r}
+library(ggplot2)
+ggplot(raw_count) + geom_histogram(aes(x = smoc2_fibrosis1), stat = "bin", bins= 200) + xlab("smoc2 fibrosis1") + ylab("raw count") 
+```
+
+check the row names in your metadata is in the sampel order as column names in your count matrix, as this is the order DESeq2 corresponds each sample, if this returns FALSE, you need to go back and make the right order.
+```{r}
+all(rownames(meta_data) == colnames(raw_count))
+```
+
+
+## DESeq2 analysis
+
+First, create DESeq2 objectm which contains a series of information including your raw counts, metadata and the design formula, specifying which variable in the meta data we want to test for differential expression analysis. you can use one or multiple variables(if testing for multiple, just type "variable1 + variable2 ...")
+```{r}
+dds_smoc2 <- DESeqDataSetFromMatrix(countData = raw_count,colData = meta_data,design = ~ conditions )
+```
+
+next, normalize raw read counts. We perform normalization because there are several source of bias in raw read counts that will skew the RNA quantification
+    1.library size: samples are are sequenced deeper have more reads
+    2.gene length: longer genes have more reads aligned
+    3.outlier genes: highly expressed DE genes and highly expressed gene from PCR amplification bias will mask other genes
+Note that if we just divide raw reads by total number of reads, you cannot remove the bias from 3. So DESeq2 uses a method that adjust the #of reads based on library size and is resistant to ourlier genes.
+```{r}
+dds_smoc2 <- estimateSizeFactors(dds_smoc2) #estimate scaling factors and reaasign back to the DESeq2 object
+sizeFactors(dds_smoc2)   
+
+normalized_counts <- counts(dds_smoc2,normalized = TRUE) #extract the normalized counts from DESeq2 object
+View(normalized_counts)
+```
+
+
+Next, perform unsupervised hierarchical clustering and PCA analysis as quality control steps. Here, we want to see similar conditions and biological replicates cluster together, if not, there might be batch effect.
+```{r}
+vsd_smoc2 <- vst(dds_smoc2, blind = TRUE)#log transformed the normalzied count to improve the visualization of clustering, DESeq2 uses a variance stabilization transformation that performs log transformation which moderates variance across mean
+
+vsd_mat_smoc2 <- assay(vsd_smoc2) #extract the log transformed normalized count from the DESeq2 object
+vsd_cor_smoc2 <- cor(vsd_mat_smoc2) #compute the correlation values
+
+View(vsd_cor_wt)
+
+pheatmap(vsd_cor_smoc2, annotation = select(meta_data,conditions)) #plot the correlation heatmap, specifying the variables in the metadata you want to visualize.You caninclude as many variables as possible in your meatdata, which you think might be sources for batch effect
+```
+
+
+Next, perform PCA as the second step of QC to further validate the quality of the data
+You can plot PCA for all sorts of variables of interests, as long as you record those variables and include them in the meta data, for example, genotype, day of experiments, technicians etc.. This is the most important way to spot batch effect
+```{r}
+plotPCA(vsd_smoc2,intgroup = "conditions")
+```
+
+Here, if you identify any outlier samples, remove them and recreate the DESeq2 object.
+
+
+
+Next, perform differrential expression analysis using DESeq function
+
+This function performs a default analysis through the steps:
+
+    1.estimation of size factors: estimateSizeFactors
+
+    2.estimation of dispersion: estimateDispersions
+
+    3.Negative Binomial GLM fitting and Wald statistics: nbinomWaldTest
+
+
+```{r}
+dds_smoc2 <- DESeq(dds_smoc2)  #run the deseq analysis on your DESeq2 object containingb RAW COUNTS
+```
+
+Next, examine how well the data fit our model. DESeq2 performs differential expression analysis by examine if the difference of a gene's inter-sample variation is significant given the intra-sample variation.
+by examining log2 fold change: log2(treatment_mean/control_mean) != 0
+For RNA-seq, a gene's expression variance is expected to increase with its mean expression, and we need to test of this relationship holds
+```{r}
+mean_counts <- apply(raw_count,1,mean) #calculate the mean for each row/gene. 1 here designates the function mean to be applied by row
+variance_counts <- apply(raw_count,1,var)#calculate the variance for each row/gene
+
+df <- data.frame(mean_counts,variance_counts) #create a data frame with mean and variance for each gene for plotting
+ggplot(df) +
+        geom_point(aes(x=mean_counts, y=variance_counts)) + 
+        scale_y_log10() +
+        scale_x_log10() +
+        xlab("Mean counts per gene") +
+        ylab("Variance per gene")
+```
+
+We should see as mean increases, variance should also increase
+
+Next, plot the dispersion of the data. DESeq2 model the dispersion as Var=μ+α∗μ^2   μ is mean and α is dispersion. So dispersion is positively correlated with variance and ngatively correlated with mean.
+```{r}
+plotDispEsts(dds_smoc2) #plot dispersion estimates on the DESeq object 
+```
+
+Each blackdot is a gene with its mean and dispersion values. We expect to see dispersion values decreases with increasing mean. And the genes should cluster around the red maximum likelihood line
+
+
+
+Now that we examined the fitness of our model, it's time to extract DE genes, you can add LFC threshold here in the results() function by  lfcThreshold argument
+```{r}
+smoc2_result <- results(dds_smoc2,contrast = c("conditions","fibrosis","normal"),alpha = 0.01) #specify your significant threshold alpha level, you need to specify the way of contrast: c("condition factor/variable to contrast","level to compare","baseline level")
+smoc2_result                        
+```
+
+To improve the estimate of LFC, we use shrinkage. This method helps to estimate the LFC of genes with limited information, to generates better LFC estimates
+
+Examine the DE genes via MA plot. The MA plot shows the mean of the normalized counts vs the log fold change(LFC). The dots represent all teh genes, and DE genes are the red dots.
+```{r}
+smoc2_result<- lfcShrink(dds_smoc2, 
+            contrast=c("conditions", "fibrosis", "normal"),
+            res=smoc2_result)
+plotMA(smoc2_result,ylim = c(-8,8)) #you can specify the range of LFC here make the plot look nicer
+```
+
+
+
+Explore the DESeq2 result table and extract DE genes. We will us the padj as our p value, which is the p value adjusted for multiple hypothesis testing using Benjamini Hochberg method(FDR ajusted P value, which help to decrease type I error/false positives)
+```{r}
+mcols(smoc2_result) #gives the content of the result table
+head(smoc2_result)
+summary(smoc2_result)
+```
+
+Next, annotate the gene names based on the ensemble gene id(currently the row names in our count table is still ensemble gene id)
+```{r}
+#first, install the annotables package through bioconductor
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("remotes")
+BiocManager::install("stephenturner/annotables")
+library(annotables)
+
+grcm38 #examine the mouse genome annotation from ensemble
+
+smoc2_result_all <- data.frame(smoc2_result) %>% rownames_to_column(var = "ensgene") %>% left_join(x = smoc2_result_all, y =grcm38[,c("ensgene", "symbol", "description")], by = "ensgene") #create a column ensgene which contains the ensemble gene names in our result table, and attach ensgene names, symbol and descrition column to our result table
+View(smoc2_result_all)
+
+```
+
+
+Next, extract the DE genes with gene names in place and arrange them by significance level
+```{r}
+smoc2_result_sig <- subset(smoc2_result_all,padj < 0.01)
+smoc2_result_sig <- smoc2_result_sig %>% arrange(padj)
+View(smoc2_result_sig)
+```
+
+
+Lastly, let's explore a series of visualization for our results
+
+Expression heatmap, which plot the normalized expression level of the genes
+```{r}
+# Subset normalized counts to significant genes 
+sig_norm_counts_smoc2 <- normalized_counts[smoc2_result_sig$ensgene, ]
+
+# Choose a color palette from RColorBrewer
+library(RColorBrewer) 
+
+heat_colors <- brewer.pal(6, "YlOrRd")
+
+# Run pheatmap
+pheatmap(sig_norm_counts_smoc2, 
+         color = heat_colors, 
+         cluster_rows = T, 
+         show_rownames = F,
+         annotation = select(meta_data, conditions), 
+         scale = "row")
+```
+
+
+Volcano plot, which shows fold change to adjusted p values for all genes
+```{r}
+# Obtain logical vector regarding whether padj values are less than 0.05 
+smoc2_result_all <- smoc2_result_all %>% mutate(threshold = padj < 0.01)
+# Volcano plot
+ggplot(smoc2_result_all) +
+        geom_point(aes(x = log2FoldChange, y = -log10(padj), 
+                   color = threshold)) +
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") +
+        ylim(0,30) +
+        theme(legend.position = "none",
+              plot.title = element_text(size = rel(1.5), hjust = 0.5),
+              axis.title = element_text(size = rel(1.25)))
+```
+
+Expression plot of top 20 genes across samples/conditions
+```{r}
+#extract the top 20 genes
+top_20 <- data.frame(sig_norm_counts_smoc2)[1:20, ] %>%
+        rownames_to_column(var = "ensgene")
+#gather to a table for plotting
+top_20 <- gather(top_20, 
+                 key = "samplename", 
+                 value = "normalized_counts", 
+                 2:8)
+#join your count table with meta data for labelling
+top_20 <- inner_join(top_20,
+                     rownames_to_column(meta_data, var = "samplename"),
+                     by = "samplename")
+#create the plot
+ggplot(top_20) +
+        geom_point(aes(x = ensgene, y = normalized_counts, color = conditions)) +
+        scale_y_log10() +
+        xlab("Genes") +
+        ylab("Normalized Counts") +
+        ggtitle("Top 20 Significant DE Genes") +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(plot.title = element_text(hjust = 0.5))
+```
+
